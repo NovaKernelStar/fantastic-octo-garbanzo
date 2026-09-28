@@ -1,0 +1,435 @@
+#!/usr/bin/env node
+/**
+ * chat.z.ai back-and-forth stress test.
+ *
+ * Sends N messages into a conversation, waits for each reply, and logs every
+ * input/output to:
+ *   logs/chat-log.jsonl   (machine-readable, one JSON object per turn)
+ *   logs/transcript.md    (human-readable)
+ *   logs/summary.json     (run stats)
+ *   logs/screenshots/     (captures on failure)
+ *
+ * Env vars:
+ *   TOTAL_TURNS        number of exchanges                 (default 300)
+ *   TURN_DELAY_MS      pause between messages              (default 2500)
+ *   REPLY_TIMEOUT_MS   max wait for a single reply         (default 180000)
+ *   NEW_CHAT_EVERY     fresh chat every K turns, 0 = one long conversation (default 0)
+ *   HEADLESS           "true"/"false"                      (default true)
+ *   TARGET_URL                                             (default https://chat.z.ai/)
+ *   STABLE_MS          quiet time before reply = finished  (default 4000)
+ *   AUTH_JSON          optional: Playwright storageState JSON for a logged-in session
+ */
+
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+
+/* ---------------------------------- config --------------------------------- */
+
+const int = (v, d) => (Number.isFinite(parseInt(v, 10)) ? parseInt(v, 10) : d);
+
+const CFG = {
+  url: process.env.TARGET_URL || 'https://chat.z.ai/',
+  totalTurns: int(process.env.TOTAL_TURNS, 300),
+  turnDelayMs: int(process.env.TURN_DELAY_MS, 2500),
+  replyTimeoutMs: int(process.env.REPLY_TIMEOUT_MS, 180000),
+  newChatEvery: int(process.env.NEW_CHAT_EVERY, 0),
+  headless: (process.env.HEADLESS ?? 'true') !== 'false',
+  logDir: process.env.LOG_DIR || 'logs',
+  stableMs: int(process.env.STABLE_MS, 4000),
+  pollMs: 500,
+  abortAfterConsecutiveFailures: 5,
+};
+
+/**
+ * Verify/tune these with:  npx playwright codegen https://chat.z.ai
+ * The script uses the first selector that matches. If NONE of the
+ * assistantMessage selectors match, it falls back to a whole-page text diff,
+ * which still logs replies correctly.
+ */
+const SELECTORS = {
+  input: [
+    'textarea[placeholder]',
+    'div[contenteditable="true"]',
+    'textarea',
+    '[role="textbox"]',
+  ],
+  sendButton: [
+    'button[aria-label*="send" i]',
+    'button[data-testid*="send" i]',
+  ],
+  stopButton: [
+    'button[aria-label*="stop" i]',
+    'button[data-testid*="stop" i]',
+  ],
+  assistantMessage: [
+    '[data-message-author-role="assistant"]',
+    '[class*="assistant" i][class*="message" i]',
+    '[class*="assistant" i][class*="bubble" i]',
+  ],
+  newChat: [
+    'a[aria-label*="new chat" i]',
+    'button[aria-label*="new chat" i]',
+    'a[href$="/new"]',
+  ],
+};
+
+/* ---------------------------------- logging -------------------------------- */
+
+const LOG_DIR = CFG.logDir;
+const JSONL_FILE = path.join(LOG_DIR, 'chat-log.jsonl');
+const TRANSCRIPT = path.join(LOG_DIR, 'transcript.md');
+const SUMMARY_FILE = path.join(LOG_DIR, 'summary.json');
+const SHOT_DIR = path.join(LOG_DIR, 'screenshots');
+
+fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function appendJsonl(entry) {
+  fs.appendFileSync(JSONL_FILE, JSON.stringify(entry) + '\n');
+}
+
+function appendTranscript(e) {
+  const status = e.ok
+    ? `✅ ok — ${(e.durationMs / 1000).toFixed(1)}s${e.ackValid ? ', ACK ✓' : ''}`
+    : `❌ FAILED — ${e.error || 'unknown error'}`;
+  const md = [
+    `## Turn ${e.turn} · ${e.timestamp} · ${status}`,
+    '',
+    '**User:**', '', '```', e.prompt, '```', '',
+  ];
+  if (e.ok) md.push('**Assistant:**', '', '```', e.response, '```', '');
+  fs.appendFileSync(TRANSCRIPT, md.join('\n'));
+}
+
+/** Resume support: highest completed turn found in an existing log. */
+function loadProgress() {
+  if (!fs.existsSync(JSONL_FILE)) return 0;
+  let last = 0;
+  for (const line of fs.readFileSync(JSONL_FILE, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e.ok && typeof e.turn === 'number' && e.turn > last) last = e.turn;
+    } catch { /* ignore corrupt lines */ }
+  }
+  return last;
+}
+
+function writeSummary(extra) {
+  fs.writeFileSync(SUMMARY_FILE, JSON.stringify({ ...extra, config: CFG }, null, 2));
+}
+
+/* -------------------------------- page helpers ------------------------------ */
+
+async function findFirst(page, selectors, { last = false, timeout = 3000 } = {}) {
+  for (const sel of selectors) {
+    const loc = last ? page.locator(sel).last() : page.locator(sel).first();
+    try {
+      await loc.waitFor({ state: 'visible', timeout });
+      return loc;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+async function anyVisible(page, selectors) {
+  for (const sel of selectors) {
+    if (await page.locator(sel).first().isVisible().catch(() => false)) return true;
+  }
+  return false;
+}
+
+/** Text of the most recent assistant message, or null if no selector matches. */
+async function latestAssistantText(page) {
+  for (const sel of SELECTORS.assistantMessage) {
+    const txt = await page
+      .locator(sel)
+      .last()
+      .innerText({ timeout: 400 })
+      .catch(() => '');
+    if (txt && txt.trim()) return txt.trim();
+  }
+  return null;
+}
+
+async function bodyText(page) {
+  return page.evaluate(() => document.body.innerText);
+}
+
+function diffTail(before, after) {
+  if (!after) return '';
+  if (before && after.startsWith(before)) return after.slice(before.length);
+  return after.length > 2000 ? after.slice(-2000) : after; // layout shifted: fallback
+}
+
+function stripPrompt(text, prompt) {
+  if (!text) return '';
+  const i = prompt ? text.lastIndexOf(prompt) : -1;
+  return i === -1 ? text : text.slice(i + prompt.length);
+}
+
+async function waitUntilReady(page) {
+  await page.goto(CFG.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  for (let i = 0; i < 6; i++) {
+    const title = await page.title().catch(() => '');
+    if (/just a moment|attention required|verify you are human/i.test(title)) {
+      console.log(`  bot-protection challenge detected, waiting 10s... (${i + 1}/6)`);
+      await sleep(10000);
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+    } else break;
+  }
+
+  const input = await findFirst(page, SELECTORS.input, { timeout: 30000 });
+  if (!input) {
+    throw new Error(
+      'Chat input never appeared. Page may require login (set the AUTH_JSON secret) ' +
+      'or is blocking automated browsers. Check logs/screenshots.'
+    );
+  }
+  console.log(`Page ready: "${await page.title()}"`);
+}
+
+async function newChat(page) {
+  const btn = await findFirst(page, SELECTORS.newChat, { timeout: 1500 });
+  if (btn) await btn.click().catch(() => {});
+  else await page.goto(CFG.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await findFirst(page, SELECTORS.input, { timeout: 30000 });
+}
+
+async function sendMessage(page, text) {
+  const input = await findFirst(page, SELECTORS.input, { timeout: 15000 });
+  if (!input) throw new Error('Chat input not found');
+
+  await input.scrollIntoViewIfNeeded().catch(() => {});
+  await input.click();
+  await input.fill('');
+  await input.fill(text);
+  await sleep(200);
+
+  let clicked = false;
+  for (const sel of SELECTORS.sendButton) {
+    const btn = page.locator(sel).first();
+    if (
+      (await btn.isVisible().catch(() => false)) &&
+      (await btn.isEnabled().catch(() => false))
+    ) {
+      await btn.click();
+      clicked = true;
+      break;
+    }
+  }
+  if (!clicked) await input.press('Enter');
+
+  // Some UIs swallow the first submit — if the box didn't clear, try Enter again.
+  await sleep(1000);
+  const leftover = await input
+    .evaluate((el) => (el.value !== undefined ? el.value : el.textContent) || '')
+    .catch(() => '');
+  if (leftover.trim()) await input.press('Enter').catch(() => {});
+}
+
+/**
+ * Waits until new content appears and stays unchanged for CFG.stableMs
+ * while no "stop generating" button is visible. Works in two modes:
+ *  - bubble mode: tracks the last assistant message element
+ *  - diff mode (fallback): tracks text appended to the page body
+ */
+async function waitForReply(page, { baselineBubble, baselineBody, prompt, timeoutMs }) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSnap = '';
+  let lastChange = Date.now();
+  let sawNew = false;
+
+  while (Date.now() < deadline) {
+    await sleep(CFG.pollMs);
+
+    const stopVisible = await anyVisible(page, SELECTORS.stopButton);
+    const bubble = await latestAssistantText(page);
+
+    let snap;
+    if (bubble !== null) {
+      snap = bubble;
+      if (snap && snap !== baselineBubble) sawNew = true;
+    } else {
+      snap = stripPrompt(diffTail(baselineBody, await bodyText(page)), prompt);
+      if (snap.trim()) sawNew = true;
+    }
+
+    if (snap && snap !== lastSnap) {
+      lastSnap = snap;
+      lastChange = Date.now();
+    }
+
+    const quietFor = Date.now() - lastChange;
+    if (sawNew && lastSnap.trim() && quietFor >= CFG.stableMs && !stopVisible) {
+      return lastSnap.trim();
+    }
+  }
+
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for a reply. Last captured: "${lastSnap.slice(0, 160)}"`
+  );
+}
+
+async function screenshot(page, name) {
+  try {
+    await page.screenshot({ path: path.join(SHOT_DIR, `${name}.png`) });
+  } catch { /* ignore */ }
+}
+
+async function recover(page) {
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+    await findFirst(page, SELECTORS.input, { timeout: 30000 });
+  } catch (e) {
+    console.error(`  recovery failed: ${e.message}`);
+  }
+}
+
+/* ------------------------------------ main --------------------------------- */
+
+(async () => {
+  const startedAt = new Date().toISOString();
+  const startTurn = loadProgress() + 1;
+  const expected = CFG.totalTurns - startTurn + 1;
+
+  console.log(
+    `chat.z.ai stress test → ${CFG.totalTurns} turns ` +
+    `(starting at ${startTurn}${startTurn > 1 ? ', resumed' : ''})`
+  );
+
+  fs.appendFileSync(
+    TRANSCRIPT,
+    `\n\n---\n# Run ${startedAt} · turns ${startTurn}–${CFG.totalTurns}\n`
+  );
+
+  if (process.env.AUTH_JSON) fs.writeFileSync('auth.json', process.env.AUTH_JSON);
+
+  const browser = await chromium.launch({
+    headless: CFG.headless,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+    ],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1366, height: 850 },
+    locale: 'en-US',
+    storageState: process.env.AUTH_JSON ? 'auth.json' : undefined,
+    userAgent: (await browser.userAgent()).replace('HeadlessChrome', 'Chrome'),
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(15000);
+
+  let ok = 0, failed = 0, ackCount = 0, consecutiveFailures = 0;
+  const durations = [];
+
+  try {
+    await waitUntilReady(page);
+  } catch (e) {
+    await screenshot(page, 'startup-failure');
+    writeSummary({ status: 'aborted-at-startup', error: String(e.message), ok, failed });
+    console.error(e.message);
+    await browser.close();
+    process.exit(1);
+  }
+
+  for (let turn = startTurn; turn <= CFG.totalTurns; turn++) {
+    if (CFG.newChatEvery > 0 && turn > startTurn && (turn - 1) % CFG.newChatEvery === 0) {
+      console.log(`  starting a new chat (every ${CFG.newChatEvery} turns)`);
+      await newChat(page);
+    }
+
+    const prompt =
+      `Stress-test message ${turn} of ${CFG.totalTurns}. ` +
+      `Reply with exactly "ACK ${turn}" followed by one short sentence.`;
+
+    const entry = { turn, timestamp: new Date().toISOString(), prompt };
+    let attempt = 0;
+    let success = false;
+
+    while (attempt < 2 && !success) {
+      attempt++;
+      const baselineBubble = (await latestAssistantText(page)) ?? '';
+      const baselineBody = await bodyText(page);
+      const t0 = Date.now();
+      try {
+        await sendMessage(page, prompt);
+        entry.response = await waitForReply(page, {
+          baselineBubble, baselineBody, prompt, timeoutMs: CFG.replyTimeoutMs,
+        });
+        entry.ackValid = new RegExp(`ACK\\s*${turn}\\b`).test(entry.response);
+        entry.durationMs = Date.now() - t0;
+        success = true;
+      } catch (err) {
+        entry.error = String((err && err.message) || err).slice(0, 800);
+        entry.durationMs = Date.now() - t0;
+        if (attempt < 2) {
+          console.log(`  turn ${turn} attempt ${attempt} failed — recovering and retrying`);
+          await recover(page);
+        }
+      }
+    }
+
+    entry.attempt = attempt;
+    entry.ok = success;
+
+    if (entry.ok) {
+      ok++; consecutiveFailures = 0;
+      durations.push(entry.durationMs);
+      if (entry.ackValid) ackCount++;
+    } else {
+      failed++; consecutiveFailures++;
+      await screenshot(page, `turn-${turn}-failure`);
+    }
+
+    appendJsonl(entry);
+    appendTranscript(entry);
+    console.log(
+      `[turn ${turn}/${CFG.totalTurns}] ${entry.ok ? 'ok' : 'FAILED'} in ` +
+      `${(entry.durationMs / 1000).toFixed(1)}s${entry.ackValid ? ' ACK✓' : ''} ` +
+      `| ok=${ok} failed=${failed}`
+    );
+
+    if (consecutiveFailures >= CFG.abortAfterConsecutiveFailures) {
+      console.error(
+        `Aborting: ${consecutiveFailures} consecutive failures — ` +
+        `the site is likely rate-limiting or blocking us.`
+      );
+      break;
+    }
+
+    await sleep(CFG.turnDelayMs + Math.random() * 1500);
+  }
+
+  const avg = durations.length
+    ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
+    : 0;
+
+  writeSummary({
+    status: ok === expected ? 'complete' : ok > 0 ? 'partial' : 'failed',
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    expected,
+    ok,
+    failed,
+    ackCount,
+    avgDurationMs: avg,
+  });
+
+  await browser.close();
+  console.log(
+    `Done: ${ok}/${expected} exchanges succeeded (ACK-valid: ${ackCount}). ` +
+    `Avg ${(avg / 1000).toFixed(1)}s per turn.`
+  );
+  process.exitCode = ok === expected ? 0 : 1;
+})();
