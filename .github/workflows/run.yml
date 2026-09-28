@@ -1,96 +1,388 @@
-name: docker-image-unit-tests
+name: chat-stress-test
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
-
-# Cancel superseded PR runs; never kill in-flight pushes to main
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    inputs:
+      total_turns:
+        description: Number of exchanges
+        default: "300"
+      turn_delay_ms:
+        description: Pause between messages (ms)
+        default: "2500"
+      new_chat_every:
+        description: Fresh chat every K turns (0 = one long conversation)
+        default: "0"
+      target_url:
+        description: Chat URL
+        default: "https://chat.z.ai/"
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  test-image:
-    name: "Test: ${{ matrix.image.name }}"
+  stress:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        image:
-          - name: service-a
-            context: .
-            dockerfile: ./Dockerfile
-            test_command: npm test -- --run
-          - name: service-b
-            context: ./api
-            dockerfile: ./api/Dockerfile
-            test_command: pytest -q
+    timeout-minutes: 345   # GitHub-hosted job hard cap is 360
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build image
-        uses: docker/build-push-action@v6
+      - uses: actions/setup-node@v4
         with:
-          context: ${{ matrix.image.context }}
-          file: ${{ matrix.image.dockerfile }}
-          tags: ${{ matrix.image.name }}:${{ github.sha }}
-          load: true
-          provenance: false
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          node-version: 20
 
-      - name: Run unit tests inside container
-        env:
-          TEST_CMD: ${{ matrix.image.test_command }}
-          IMAGE: ${{ matrix.image.name }}:${{ github.sha }}
+      - name: Install Playwright + Chromium
         run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          chmod 777 artifacts   # allow non-root container users to write here
-          # --entrypoint makes the command run identically regardless of the
-          # image's ENTRYPOINT; plain `sh -c` avoids login-shell PATH resets.
-          docker run --rm \
-            --init \
-            --entrypoint /bin/sh \
-            -v "$PWD/artifacts:/artifacts" \
-            -e TEST_CMD \
-            "$IMAGE" \
-            -c 'eval "$TEST_CMD"' 2>&1 | tee test-output.log
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
 
-      - name: Upload logs on failure
-        if: failure() || cancelled()
+      - name: Write stress-test script
+        run: |
+          cat > chat-stress.js <<'EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+
+          const int = (v, d) => (Number.isFinite(parseInt(v, 10)) ? parseInt(v, 10) : d);
+
+          const CFG = {
+            url: process.env.TARGET_URL || 'https://chat.z.ai/',
+            totalTurns: int(process.env.TOTAL_TURNS, 300),
+            turnDelayMs: int(process.env.TURN_DELAY_MS, 2500),
+            replyTimeoutMs: int(process.env.REPLY_TIMEOUT_MS, 180000),
+            newChatEvery: int(process.env.NEW_CHAT_EVERY, 0),
+            headless: (process.env.HEADLESS ?? 'true') !== 'false',
+            logDir: process.env.LOG_DIR || 'logs',
+            stableMs: int(process.env.STABLE_MS, 4000),
+            pollMs: 500,
+            abortAfterConsecutiveFailures: 5,
+          };
+
+          const SELECTORS = {
+            input: ['textarea[placeholder]', 'div[contenteditable="true"]', 'textarea', '[role="textbox"]'],
+            sendButton: ['button[aria-label*="send" i]', 'button[data-testid*="send" i]'],
+            stopButton: ['button[aria-label*="stop" i]', 'button[data-testid*="stop" i]'],
+            assistantMessage: [
+              '[data-message-author-role="assistant"]',
+              '[class*="assistant" i][class*="message" i]',
+              '[class*="assistant" i][class*="bubble" i]',
+            ],
+            newChat: ['a[aria-label*="new chat" i]', 'button[aria-label*="new chat" i]', 'a[href$="/new"]'],
+          };
+
+          const LOG_DIR = CFG.logDir;
+          const JSONL_FILE = path.join(LOG_DIR, 'chat-log.jsonl');
+          const TRANSCRIPT = path.join(LOG_DIR, 'transcript.md');
+          const SUMMARY_FILE = path.join(LOG_DIR, 'summary.json');
+          const SHOT_DIR = path.join(LOG_DIR, 'screenshots');
+          fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const appendJsonl = (e) => fs.appendFileSync(JSONL_FILE, JSON.stringify(e) + '\n');
+
+          function appendTranscript(e) {
+            const status = e.ok
+              ? `OK ${(e.durationMs / 1000).toFixed(1)}s${e.ackValid ? ', ACK valid' : ', ACK MISSING'}`
+              : `FAILED: ${e.error || 'unknown error'}`;
+            const md = [`## Turn ${e.turn} | ${e.timestamp} | ${status}`, '', '**User:**', '', '```', e.prompt, '```', ''];
+            if (e.ok) md.push('**Assistant:**', '', '```', e.response, '```', '');
+            fs.appendFileSync(TRANSCRIPT, md.join('\n') + '\n');
+          }
+
+          function loadProgress() {
+            if (!fs.existsSync(JSONL_FILE)) return 0;
+            let last = 0;
+            for (const line of fs.readFileSync(JSONL_FILE, 'utf8').split('\n')) {
+              if (!line.trim()) continue;
+              try {
+                const e = JSON.parse(line);
+                if (e.ok && typeof e.turn === 'number' && e.turn > last) last = e.turn;
+              } catch {}
+            }
+            return last;
+          }
+
+          const writeSummary = (extra) =>
+            fs.writeFileSync(SUMMARY_FILE, JSON.stringify({ ...extra, config: CFG }, null, 2));
+
+          async function findFirst(page, selectors, { timeout = 3000 } = {}) {
+            for (const sel of selectors) {
+              const loc = page.locator(sel).first();
+              try {
+                await loc.waitFor({ state: 'visible', timeout });
+                return loc;
+              } catch {}
+            }
+            return null;
+          }
+
+          async function anyVisible(page, selectors) {
+            for (const sel of selectors) {
+              if (await page.locator(sel).first().isVisible().catch(() => false)) return true;
+            }
+            return false;
+          }
+
+          async function latestAssistantText(page) {
+            for (const sel of SELECTORS.assistantMessage) {
+              const txt = await page.locator(sel).last().innerText({ timeout: 400 }).catch(() => '');
+              if (txt && txt.trim()) return txt.trim();
+            }
+            return null;
+          }
+
+          const bodyText = (page) => page.evaluate(() => document.body.innerText);
+
+          function diffTail(before, after) {
+            if (!after) return '';
+            if (before && after.startsWith(before)) return after.slice(before.length);
+            return after.length > 2000 ? after.slice(-2000) : after;
+          }
+
+          function stripPrompt(text, prompt) {
+            if (!text) return '';
+            const i = prompt ? text.lastIndexOf(prompt) : -1;
+            return i === -1 ? text : text.slice(i + prompt.length);
+          }
+
+          async function waitUntilReady(page) {
+            await page.goto(CFG.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            for (let i = 0; i < 6; i++) {
+              const title = await page.title().catch(() => '');
+              if (/just a moment|attention required|verify you are human/i.test(title)) {
+                console.log(`  bot-protection challenge detected, waiting 10s (${i + 1}/6)`);
+                await sleep(10000);
+                await page.waitForLoadState('domcontentloaded').catch(() => {});
+              } else break;
+            }
+            const input = await findFirst(page, SELECTORS.input, { timeout: 30000 });
+            if (!input) {
+              throw new Error(
+                'Chat input never appeared. The page may require login (set the AUTH_JSON secret) ' +
+                'or is blocking automated browsers. Check logs/screenshots.'
+              );
+            }
+            console.log(`Page ready: "${await page.title()}"`);
+          }
+
+          async function newChat(page) {
+            const btn = await findFirst(page, SELECTORS.newChat, { timeout: 1500 });
+            if (btn) await btn.click().catch(() => {});
+            else await page.goto(CFG.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await findFirst(page, SELECTORS.input, { timeout: 30000 });
+          }
+
+          async function sendMessage(page, text) {
+            const input = await findFirst(page, SELECTORS.input, { timeout: 15000 });
+            if (!input) throw new Error('Chat input not found');
+            await input.scrollIntoViewIfNeeded().catch(() => {});
+            await input.click();
+            await input.fill('');
+            await input.fill(text);
+            await sleep(200);
+            let clicked = false;
+            for (const sel of SELECTORS.sendButton) {
+              const btn = page.locator(sel).first();
+              if ((await btn.isVisible().catch(() => false)) && (await btn.isEnabled().catch(() => false))) {
+                await btn.click();
+                clicked = true;
+                break;
+              }
+            }
+            if (!clicked) await input.press('Enter');
+            await sleep(1000);
+            const leftover = await input
+              .evaluate((el) => (el.value !== undefined ? el.value : el.textContent) || '')
+              .catch(() => '');
+            if (leftover.trim()) await input.press('Enter').catch(() => {});
+          }
+
+          async function waitForReply(page, { baselineBubble, baselineBody, prompt, timeoutMs }) {
+            const deadline = Date.now() + timeoutMs;
+            let lastSnap = '';
+            let lastChange = Date.now();
+            let sawNew = false;
+            while (Date.now() < deadline) {
+              await sleep(CFG.pollMs);
+              const stopVisible = await anyVisible(page, SELECTORS.stopButton);
+              const bubble = await latestAssistantText(page);
+              let snap;
+              if (bubble !== null) {
+                snap = bubble;
+                if (snap && snap !== baselineBubble) sawNew = true;
+              } else {
+                snap = stripPrompt(diffTail(baselineBody, await bodyText(page)), prompt);
+                if (snap.trim()) sawNew = true;
+              }
+              if (snap && snap !== lastSnap) {
+                lastSnap = snap;
+                lastChange = Date.now();
+              }
+              if (sawNew && lastSnap.trim() && Date.now() - lastChange >= CFG.stableMs && !stopVisible) {
+                return lastSnap.trim();
+              }
+            }
+            throw new Error(`Timed out after ${timeoutMs}ms waiting for a reply. Last captured: "${lastSnap.slice(0, 160)}"`);
+          }
+
+          async function screenshot(page, name) {
+            try { await page.screenshot({ path: path.join(SHOT_DIR, `${name}.png`) }); } catch {}
+          }
+
+          async function recover(page) {
+            try {
+              await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+              await findFirst(page, SELECTORS.input, { timeout: 30000 });
+            } catch (e) {
+              console.error(`  recovery failed: ${e.message}`);
+            }
+          }
+
+          (async () => {
+            const startedAt = new Date().toISOString();
+            const startTurn = loadProgress() + 1;
+            const expected = CFG.totalTurns - startTurn + 1;
+
+            console.log(`Stress test: ${CFG.totalTurns} turns (starting at ${startTurn}) -> ${CFG.url}`);
+            fs.appendFileSync(TRANSCRIPT, `\n# Run ${startedAt} | turns ${startTurn}-${CFG.totalTurns}\n\n`);
+
+            if (process.env.AUTH_JSON) fs.writeFileSync('auth.json', process.env.AUTH_JSON);
+
+            const browser = await chromium.launch({
+              headless: CFG.headless,
+              args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--no-sandbox'],
+            });
+            const context = await browser.newContext({
+              viewport: { width: 1366, height: 850 },
+              locale: 'en-US',
+              storageState: process.env.AUTH_JSON ? 'auth.json' : undefined,
+              userAgent: (await browser.userAgent()).replace('HeadlessChrome', 'Chrome'),
+            });
+            await context.addInitScript(() => {
+              Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            });
+            const page = await context.newPage();
+            page.setDefaultTimeout(15000);
+
+            let ok = 0, failed = 0, ackCount = 0, consecutiveFailures = 0;
+            const durations = [];
+
+            try {
+              await waitUntilReady(page);
+            } catch (e) {
+              await screenshot(page, 'startup-failure');
+              writeSummary({ status: 'aborted-at-startup', error: String(e.message), ok, failed });
+              console.error(e.message);
+              await browser.close();
+              process.exit(1);
+            }
+
+            for (let turn = startTurn; turn <= CFG.totalTurns; turn++) {
+              if (CFG.newChatEvery > 0 && turn > startTurn && (turn - 1) % CFG.newChatEvery === 0) {
+                console.log(`  starting a new chat (every ${CFG.newChatEvery} turns)`);
+                await newChat(page);
+              }
+
+              const prompt =
+                `Stress-test message ${turn} of ${CFG.totalTurns}. ` +
+                `Reply with exactly "ACK ${turn}" followed by one short sentence.`;
+
+              const entry = { turn, timestamp: new Date().toISOString(), prompt };
+              let attempt = 0;
+              let success = false;
+
+              while (attempt < 2 && !success) {
+                attempt++;
+                const baselineBubble = (await latestAssistantText(page)) ?? '';
+                const baselineBody = await bodyText(page);
+                const t0 = Date.now();
+                try {
+                  await sendMessage(page, prompt);
+                  entry.response = await waitForReply(page, {
+                    baselineBubble, baselineBody, prompt, timeoutMs: CFG.replyTimeoutMs,
+                  });
+                  entry.ackValid = new RegExp(`ACK\\s*${turn}\\b`).test(entry.response);
+                  entry.durationMs = Date.now() - t0;
+                  success = true;
+                } catch (err) {
+                  entry.error = String((err && err.message) || err).slice(0, 800);
+                  entry.durationMs = Date.now() - t0;
+                  if (attempt < 2) {
+                    console.log(`  turn ${turn} attempt ${attempt} failed, recovering and retrying`);
+                    await recover(page);
+                  }
+                }
+              }
+
+              entry.attempt = attempt;
+              entry.ok = success;
+
+              if (entry.ok) {
+                ok++; consecutiveFailures = 0;
+                durations.push(entry.durationMs);
+                if (entry.ackValid) ackCount++;
+              } else {
+                failed++; consecutiveFailures++;
+                await screenshot(page, `turn-${turn}-failure`);
+              }
+
+              appendJsonl(entry);
+              appendTranscript(entry);
+              console.log(
+                `[turn ${turn}/${CFG.totalTurns}] ${entry.ok ? 'ok' : 'FAILED'} in ` +
+                `${(entry.durationMs / 1000).toFixed(1)}s${entry.ackValid ? ' ACK' : ''} | ok=${ok} failed=${failed}`
+              );
+
+              if (consecutiveFailures >= CFG.abortAfterConsecutiveFailures) {
+                console.error(`Aborting: ${consecutiveFailures} consecutive failures (rate-limited or blocked?)`);
+                break;
+              }
+
+              await sleep(CFG.turnDelayMs + Math.random() * 1500);
+            }
+
+            const avg = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
+            writeSummary({
+              status: ok === expected ? 'complete' : ok > 0 ? 'partial' : 'failed',
+              startedAt,
+              finishedAt: new Date().toISOString(),
+              expected, ok, failed, ackCount,
+              avgDurationMs: avg,
+            });
+
+            await browser.close();
+            console.log(`Done: ${ok}/${expected} succeeded (ACK-valid: ${ackCount}). Avg ${(avg / 1000).toFixed(1)}s/turn.`);
+            process.exitCode = ok === expected ? 0 : 1;
+          })();
+          EOF
+
+      - name: Run stress test
+        env:
+          TOTAL_TURNS: ${{ inputs.total_turns }}
+          TURN_DELAY_MS: ${{ inputs.turn_delay_ms }}
+          NEW_CHAT_EVERY: ${{ inputs.new_chat_every }}
+          TARGET_URL: ${{ inputs.target_url }}
+          HEADLESS: "true"
+          AUTH_JSON: ${{ secrets.AUTH_JSON }}   # optional
+        run: node chat-stress.js
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Chat stress test"
+            echo '```json'
+            cat logs/summary.json 2>/dev/null || echo '{"status":"no summary written"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.image.name }}-${{ github.run_attempt }}
-          path: |
-            test-output.log
-            artifacts/
+          name: chat-logs-${{ github.run_attempt }}
+          path: logs/
           if-no-files-found: ignore
-
-  summary:
-    needs: test-image
-    runs-on: ubuntu-latest
-    if: ${{ !cancelled() }}
-    steps:
-      - name: Final verdict
-        env:
-          RESULT: ${{ needs.test-image.result }}
-        run: |
-          echo "test-image result: $RESULT"
-          case "$RESULT" in
-            success)
-              echo "All images passed their unit tests." ;;
-            *)
-              echo "::error::One or more images failed their unit tests (result: $RESULT)"
-              exit 1 ;;
-          esac
