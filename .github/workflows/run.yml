@@ -1,13 +1,9 @@
 # =============================================================================
-# chat.z.ai stress test — single-file version (v2)
+# chat.z.ai stress test — single-file version (v3)
 #
-# v2 changes (after startup failures on the runner):
-#   - Headed Chromium under xvfb by default (headless gets bot-blocked)
-#   - Waits up to 120s for Cloudflare challenges to clear (title AND body checks)
-#   - Dismisses cookie banners
-#   - On startup failure: dumps title/URL/body text/screenshot/page HTML to
-#     logs/debug/ -> artifact + job summary, so failures are self-explanatory
-#   - Pinned Playwright version + browser cache for faster, stable runs
+# v3: fixed the v2 crash "browser.userAgent is not a function" — Playwright
+#     has no such method; we now read the live UA from a probe page instead.
+#     No other changes.
 #
 # Everything lives here: the workflow AND the Playwright script (heredoc).
 # Logs land in the run artifact:
@@ -353,11 +349,23 @@ jobs:
               headless: CFG.headless,
               args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
             });
+
+            // Playwright has no browser.userAgent() (that was the v2 crash).
+            // Read the browser's real UA from a throwaway page instead.
+            let realUA = '';
+            try {
+              const probe = await browser.newContext();
+              realUA = await (await probe.newPage()).evaluate(() => navigator.userAgent);
+              await probe.close();
+            } catch {}
+            const userAgent = realUA.replace(/Headless/i, '').trim();
+            log(`user agent: ${userAgent || '(browser default)'}`);
+
             const context = await browser.newContext({
               viewport: { width: 1366, height: 850 },
               locale: 'en-US',
               storageState: process.env.AUTH_JSON ? 'auth.json' : undefined,
-              userAgent: (await browser.userAgent()).replace('HeadlessChrome', 'Chrome'),
+              ...(userAgent ? { userAgent } : {}),
             });
             await context.addInitScript(() => {
               Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -502,7 +510,7 @@ jobs:
 # =============================================================================
 # NOTES
 #
-# If it still fails at startup:
+# If it fails at startup now:
 #   1. Open the run's artifact -> logs/debug/startup.json + startup.png +
 #      page.html. That shows exactly what the site rendered (Cloudflare
 #      challenge, login wall, layout change...).
@@ -511,8 +519,6 @@ jobs:
 #         log in, then close the window.
 #      b. Put the contents of auth.json into a repo secret ZAI_AUTH_JSON
 #         (already wired to AUTH_JSON in the run step).
-#   3. The pasted log you sent omitted the "Run stress test" step — that step
-#      contains the actual error text; check it first if things fail again.
 #
 # Tuning:
 #   - Replies cut off mid-stream -> raise STABLE_MS (add env, e.g. '8000')
