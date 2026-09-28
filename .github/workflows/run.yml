@@ -266,12 +266,35 @@ jobs:
             fs.appendFileSync(path.join(LOG_DIR, 'events.jsonl'), JSON.stringify(event) + '\n');
           }
           
+          let blockedReason = null;
+          async function assertUnblocked(page) {
+            if (!blockedReason) {
+              const selectors = ['#aliyunCaptcha-btn-refresh', '#aliyunCaptcha-window',
+                'iframe[src*="captcha" i]', '[role="dialog"]'];
+              const text = await bodyText(page).catch(() => '');
+              const challengeText = /please complete security verification|please drag the slider to complete the puzzle|verify you are human|checking your browser/i;
+              const widget = await anyVisible(page, selectors.slice(0, 3));
+              if (widget || challengeText.test(text)) {
+                blockedReason = widget ? 'Visible CAPTCHA/security verification widget' : 'Security verification required by the page';
+                vlog(`BLOCKED: ${blockedReason}. Stopping without retry.`);
+                await captureDebug(page, 'BLOCKED-security-verification');
+              }
+            }
+            if (blockedReason) {
+              const error = new Error(blockedReason);
+              error.code = 'SECURITY_BLOCK';
+              throw error;
+            }
+          }
+          
           async function action(page, label, fn) {
             await screenshot(page, `${label}-before`);
             const start = Date.now();
             vlog(`ACTION START: ${label}`);
             try {
+              await assertUnblocked(page);
               const result = await fn();
+              await assertUnblocked(page);
               vlog(`ACTION OK: ${label} (${Date.now() - start}ms)`);
               await screenshot(page, `${label}-after`);
               return result;
@@ -306,6 +329,7 @@ jobs:
             vlog(`Navigation done: status=${resp ? resp.status() : 'n/a'} url=${page.url()}`);
           
             for (let i = 0; i < 6; i++) {
+              await assertUnblocked(page);
               const title = await page.title().catch(() => '');
               vlog(`  title check ${i + 1}/6: "${title}"`);
               if (/just a moment|attention required|verify you are human/i.test(title)) {
@@ -335,6 +359,7 @@ jobs:
           }
           
           async function sendMessage(page, text, tag) {
+            await assertUnblocked(page);
             const input = await findFirst(page, SELECTORS.input, { timeout: 15000, label: 'input' });
             if (!input) throw new Error('Chat input not found (no input selector matched, see PROBE output)');
           
@@ -400,6 +425,7 @@ jobs:
             while (Date.now() < deadline) {
               await sleep(CFG.pollMs);
               polls++;
+              await assertUnblocked(page);
               stopVisible = await anyVisible(page, SELECTORS.stopButton);
               const a = await latestAssistant(page);
               let snap;
@@ -410,7 +436,7 @@ jobs:
               } else {
                 mode = 'body-diff (NO assistant selector matched)';
                 snap = stripPrompt(diffTail(baselineBody, await bodyText(page)), prompt);
-                if (snap.trim()) sawNew = true;
+                // Body text is diagnostic only; never accept it as an assistant reply.
               }
           
               if (snap && snap !== lastSnap) {
@@ -430,7 +456,7 @@ jobs:
                 dlog(`${tag} waiting ${((Date.now() - start) / 1000).toFixed(0)}s | mode=${mode} | sawNew=${sawNew} | snapLen=${lastSnap.length} | stopBtn=${stopVisible} | quietFor=${quietFor}ms (need ${CFG.stableMs})`);
               }
           
-              if (sawNew && lastSnap.trim() && quietFor >= CFG.stableMs && !stopVisible) {
+              if (a.text !== null && snap !== baselineBubble && sawNew && lastSnap.trim() && quietFor >= CFG.stableMs && !stopVisible) {
                 vlog(`${tag} reply complete after ${((Date.now() - start) / 1000).toFixed(1)}s (${polls} polls, mode=${mode})`);
                 await screenshot(page, `${tag}-reply-complete`);
                 return lastSnap.trim();
@@ -512,7 +538,7 @@ jobs:
             } catch (e) {
               vlog(`STARTUP FAILED: ${e.message}`);
               await captureDebug(page, 'startup-failure');
-              writeSummary({ status: 'aborted-at-startup', error: String(e.message), ok, failed });
+              writeSummary({ status: blockedReason ? 'blocked' : 'aborted-at-startup', blockedReason, error: String(e.message), ok, failed });
               await browser.close();
               process.exit(1);
             }
@@ -558,19 +584,23 @@ jobs:
                     baselineBubble, baselineBody, prompt, timeoutMs: CFG.replyTimeoutMs, tag,
                   });
                   entry.durationMs = Date.now() - t0;
-                  entry.ackValid = new RegExp(`ACK\\s*${turn}\\b`).test(entry.response);
-                  success = true; // Capture success; ACK correctness is reported separately.
+                  entry.ackValid = new RegExp(`^ACK\\s*${turn}\\b`).test(entry.response);
+                  success = false;
           
                   block(`${tag} OUTPUT received from chat`, entry.response);
                   vlog(`${tag} RESULT: reply captured in ${(entry.durationMs / 1000).toFixed(1)}s | expected "ACK ${turn}" found: ${entry.ackValid}`);
           
                   if (!entry.ackValid) {
                     vlog(`${tag} WARNING: reply does NOT contain "ACK ${turn}". Either the site replied differently, or the captured text is not the reply (wrong element / partial / previous message).`);
-                    await captureDebug(page, `turn-${turn}-a${attempt}-noack`);
+                    stage = 'validate-ACK';
+                    throw new Error(`Invalid assistant response: expected ACK ${turn} at the start`);
                   } else if (turn <= 2) {
                     await captureDebug(page, `turn-${turn}-a${attempt}-sample`);
                   }
+                  success = true;
                 } catch (err) {
+                  success = false;
+                  try { await assertUnblocked(page); } catch (blockError) { err = blockError; }
                   const msg = String((err && err.message) || err);
                   const ms = Date.now() - t0;
                   lastError = msg.slice(0, 800);
@@ -582,6 +612,10 @@ jobs:
                   if (err && err.stack) block(`${tag} stack trace`, err.stack);
                   await captureDebug(page, `turn-${turn}-a${attempt}-FAIL-${stage}`);
           
+                  if (blockedReason) {
+                    entry.blocked = true;
+                    break;
+                  }
                   if (attempt < 2) {
                     vlog(`${tag} will recover and retry (same prompt will be sent again)`);
                     await recover(page);
@@ -604,7 +638,7 @@ jobs:
           
               appendJsonl(entry);
               appendTranscript(entry);
-              writeSummary({ status: 'running', startedAt, lastTurn: turn, expected, ok, failed, ackCount, screenshots: captureSequence });
+              writeSummary({ status: blockedReason ? 'blocked' : 'running', blockedReason, startedAt, lastTurn: turn, expected, ok, failed, ackCount, screenshots: captureSequence });
           
               vlog(
                 `[turn ${turn}/${CFG.totalTurns}] ${entry.ok ? 'OK' : 'FAILED'} | ` +
@@ -612,6 +646,10 @@ jobs:
                 `ACK=${entry.ackValid ? 'yes' : 'NO'} | totals: ok=${ok} failed=${failed} ackValid=${ackCount}`
               );
           
+              if (blockedReason) {
+                vlog(`RUN BLOCKED: ${blockedReason}`);
+                break;
+              }
               if (consecutiveFailures >= CFG.abortAfterConsecutiveFailures) {
                 vlog(`ABORTING: ${consecutiveFailures} consecutive failed turns (rate limit or block?)`);
                 break;
@@ -638,11 +676,12 @@ jobs:
                 for (const a of e.attemptLog) emit(`    turn ${e.turn} a${a.attempt} [${a.stage}] ${a.durationMs}ms :: ${a.error}`);
               }
             }
-            const noAck = allEntries.filter((e) => e.ok && !e.ackValid).map((e) => e.turn);
+            const noAck = allEntries.filter((e) => e.response && !e.ackValid).map((e) => e.turn);
             if (noAck.length) emit(`  Turns whose reply did NOT contain the expected ACK: ${noAck.join(', ')}`);
           
             writeSummary({
-              status: ok === expected && ackCount === expected ? 'complete' : ok > 0 ? 'partial' : 'failed',
+              blockedReason,
+              status: blockedReason ? 'blocked' : ok === expected && ackCount === expected ? 'complete' : ok > 0 ? 'partial' : 'failed',
               startedAt,
               finishedAt: new Date().toISOString(),
               expected, ok, failed, ackCount,
@@ -655,7 +694,9 @@ jobs:
             process.exitCode = ok === expected && ackCount === expected ? 0 : 1;
           })().catch((err) => {
             vlog('FATAL ERROR:', String(err.stack || err));
-            writeSummary({ status: 'fatal', error: String(err.stack || err) });
+            let previous = {};
+            try { previous = JSON.parse(fs.readFileSync(SUMMARY_FILE, 'utf8')); } catch {}
+            writeSummary({ ...previous, status: blockedReason ? 'blocked' : 'fatal', blockedReason, error: String(err.stack || err) });
             process.exit(1);
           });
           EOF
