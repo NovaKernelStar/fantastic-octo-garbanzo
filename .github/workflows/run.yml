@@ -11,7 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Least privilege — the workflow never needs more than reading the repo
 permissions:
   contents: read
 
@@ -21,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
-      max-parallel: 1        # one container at a time, strictly sequential
-      fail-fast: false       # still test remaining images after one fails
+      max-parallel: 1
+      fail-fast: false
       matrix:
         image:
           - name: service-a
@@ -46,27 +45,27 @@ jobs:
           file: ${{ matrix.image.dockerfile }}
           tags: ${{ matrix.image.name }}:${{ github.sha }}
           load: true
-          # Plain single-platform manifest — avoids OCI-index quirks when
-          # docker run consumes a loaded image with default attestations
           provenance: false
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
 
       - name: Run unit tests inside container
         env:
-          # Passed via env so it's evaluated by the CONTAINER's shell, not
-          # the host. Commands may safely contain quotes, &&, pipes, etc.
           TEST_CMD: ${{ matrix.image.test_command }}
+          IMAGE: ${{ matrix.image.name }}:${{ github.sha }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          # For images whose ENTRYPOINT ignores "$@", add: --entrypoint /bin/sh
+          chmod 777 artifacts   # allow non-root container users to write here
+          # --entrypoint makes the command run identically regardless of the
+          # image's ENTRYPOINT; plain `sh -c` avoids login-shell PATH resets.
           docker run --rm \
             --init \
+            --entrypoint /bin/sh \
             -v "$PWD/artifacts:/artifacts" \
             -e TEST_CMD \
-            "${{ matrix.image.name }}:${{ github.sha }}" \
-            sh -lc 'eval "$TEST_CMD"' 2>&1 | tee test-output.log
+            "$IMAGE" \
+            -c 'eval "$TEST_CMD"' 2>&1 | tee test-output.log
 
       - name: Upload logs on failure
         if: failure() || cancelled()
@@ -81,16 +80,17 @@ jobs:
   summary:
     needs: test-image
     runs-on: ubuntu-latest
-    if: always() && !cancelled()
+    if: ${{ !cancelled() }}
     steps:
       - name: Final verdict
+        env:
+          RESULT: ${{ needs.test-image.result }}
         run: |
-          result="${{ needs.test-image.result }}"
-          echo "test-image result: $result"
-          case "$result" in
+          echo "test-image result: $RESULT"
+          case "$RESULT" in
             success)
               echo "All images passed their unit tests." ;;
             *)
-              echo "::error::One or more images failed their unit tests (result: $result)"
+              echo "::error::One or more images failed their unit tests (result: $RESULT)"
               exit 1 ;;
           esac
